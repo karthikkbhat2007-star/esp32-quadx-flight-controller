@@ -1,0 +1,240 @@
+// 🚀 OPEN-SOURCE ESP32 FLIGHT CONTROLLER - ULTIMATE EDITION 🚀
+// Upgraded with D-Term Filtering, Modular PIDs, Failsafes, and Non-blocking loops.
+
+#include <Wire.h>
+#include <ESP32Servo.h>
+
+volatile float RatePitch, RateRoll, RateYaw;
+float RateCalibrationPitch, RateCalibrationRoll, RateCalibrationYaw;
+float AccXCalibration, AccYCalibration, AccZCalibration;
+
+int ESCfreq = 500;
+float t = 0.004;      // Loop time cycle (4ms = 250Hz)
+
+// --- PID Gains ---
+float PAngleRoll = 2.0, IAngleRoll = 0.5, DAngleRoll = 0.007;
+float PAnglePitch = PAngleRoll, IAnglePitch = IAngleRoll, DAnglePitch = DAngleRoll;
+
+float PRateRoll = 0.625, IRateRoll = 2.1, DRateRoll = 0.0088;
+float PRatePitch = PRateRoll, IRatePitch = IRateRoll, DRatePitch = DRateRoll;
+float PRateYaw = 4.0, IRateYaw = 3.0, DRateYaw = 0.0;
+
+// --- Hardware Pins ---
+const int mot1_pin = 13, mot2_pin = 12, mot3_pin = 14, mot4_pin = 27;
+const int channel_1_pin = 34, channel_2_pin = 35, channel_3_pin = 32;
+const int channel_4_pin = 33, channel_5_pin = 25, channel_6_pin = 26;
+
+Servo mot1, mot2, mot3, mot4;
+
+// --- Receiver Variables ---
+volatile uint32_t timer_1, timer_2, timer_3, timer_4, timer_5, timer_6;
+volatile uint8_t last_channel_1, last_channel_2, last_channel_3;
+volatile uint8_t last_channel_4, last_channel_5, last_channel_6;
+volatile int ReceiverValue[6] = {1500, 1500, 1000, 1500, 1000, 1000};
+volatile uint32_t last_rx_time = 0; // For Failsafe
+
+// --- PID State Variables ---
+float PrevErrorAngleRoll, PrevItermAngleRoll, PrevDtermAngleRoll;
+float PrevErrorAnglePitch, PrevItermAnglePitch, PrevDtermAnglePitch;
+float PrevErrorRateRoll, PrevItermRateRoll, PrevDtermRateRoll;
+float PrevErrorRatePitch, PrevItermRatePitch, PrevDtermRatePitch;
+float PrevErrorRateYaw, PrevItermRateYaw, PrevDtermRateYaw;
+
+int ThrottleIdle = 1170;
+int ThrottleCutOff = 1000;
+
+float AccX, AccY, AccZ;
+float AngleRoll, AnglePitch;
+float complementaryAngleRoll = 0.0f, complementaryAnglePitch = 0.0f;
+
+uint32_t LoopTimer;
+
+// ============================================================================
+// MODULAR PID CONTROLLER (With D-Term Filtering)
+// ============================================================================
+float computePID(float error, float p, float i, float d, 
+                 float &prev_error, float &prev_iterm, float &prev_dterm, 
+                 float dt, float output_limit = 400.0f) {
+  
+  float Pterm = p * error;
+  
+  // Anti-Windup I-Term
+  float Iterm = prev_iterm + (i * (error + prev_error) * (dt / 2.0f));
+  Iterm = constrain(Iterm, -output_limit, output_limit);
+  
+  // D-Term with Low Pass Filter (Crucial for preventing hot motors)
+  float raw_Dterm = d * ((error - prev_error) / dt);
+  float lpf_alpha = 0.3f; // Filter strength (0.0 = total filter, 1.0 = no filter)
+  float Dterm = (lpf_alpha * raw_Dterm) + ((1.0f - lpf_alpha) * prev_dterm);
+  
+  // Save states for next loop
+  prev_error = error;
+  prev_iterm = Iterm;
+  prev_dterm = Dterm;
+  
+  float PIDOutput = Pterm + Iterm + Dterm;
+  return constrain(PIDOutput, -output_limit, output_limit);
+}
+
+// ============================================================================
+// INTERRUPT SERVICE ROUTINE (Now with IRAM_ATTR to prevent ESP32 crashes)
+// ============================================================================
+void IRAM_ATTR channelInterruptHandler() {
+  uint32_t current_time = micros();
+  last_rx_time = current_time; // Update failsafe timer
+
+  if (digitalRead(channel_1_pin)) { if (last_channel_1 == 0) { last_channel_1 = 1; timer_1 = current_time; } } else if (last_channel_1 == 1) { last_channel_1 = 0; ReceiverValue[0] = current_time - timer_1; } 
+  if (digitalRead(channel_2_pin)) { if (last_channel_2 == 0) { last_channel_2 = 1; timer_2 = current_time; } } else if (last_channel_2 == 1) { last_channel_2 = 0; ReceiverValue[1] = current_time - timer_2; } 
+  if (digitalRead(channel_3_pin)) { if (last_channel_3 == 0) { last_channel_3 = 1; timer_3 = current_time; } } else if (last_channel_3 == 1) { last_channel_3 = 0; ReceiverValue[2] = current_time - timer_3; } 
+  if (digitalRead(channel_4_pin)) { if (last_channel_4 == 0) { last_channel_4 = 1; timer_4 = current_time; } } else if (last_channel_4 == 1) { last_channel_4 = 0; ReceiverValue[3] = current_time - timer_4; } 
+  if (digitalRead(channel_5_pin)) { if (last_channel_5 == 0) { last_channel_5 = 1; timer_5 = current_time; } } else if (last_channel_5 == 1) { last_channel_5 = 0; ReceiverValue[4] = current_time - timer_5; } 
+  if (digitalRead(channel_6_pin)) { if (last_channel_6 == 0) { last_channel_6 = 1; timer_6 = current_time; } } else if (last_channel_6 == 1) { last_channel_6 = 0; ReceiverValue[5] = current_time - timer_6; }
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(15, OUTPUT);
+  for(int i=0; i<6; i++) { // Startup Blink
+    digitalWrite(15, !digitalRead(15));
+    delay(100);
+  }
+
+  // Setup Receiver Pins
+  pinMode(channel_1_pin, INPUT_PULLUP); pinMode(channel_2_pin, INPUT_PULLUP);
+  pinMode(channel_3_pin, INPUT_PULLUP); pinMode(channel_4_pin, INPUT_PULLUP);
+  pinMode(channel_5_pin, INPUT_PULLUP); pinMode(channel_6_pin, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(channel_1_pin), channelInterruptHandler, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_2_pin), channelInterruptHandler, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_3_pin), channelInterruptHandler, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_4_pin), channelInterruptHandler, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_5_pin), channelInterruptHandler, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_6_pin), channelInterruptHandler, CHANGE);
+  
+  // Setup I2C & MPU6050
+  Wire.setClock(400000);
+  Wire.begin();
+  delay(250);
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B);
+  Wire.write(0x00); // Wake up MPU
+  Wire.endTransmission();
+
+  // Setup Motors
+  ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2); ESP32PWM::allocateTimer(3);
+
+  mot1.setPeriodHertz(ESCfreq); mot1.attach(mot1_pin, 1000, 2000);
+  mot2.setPeriodHertz(ESCfreq); mot2.attach(mot2_pin, 1000, 2000);
+  mot3.setPeriodHertz(ESCfreq); mot3.attach(mot3_pin, 1000, 2000);
+  mot4.setPeriodHertz(ESCfreq); mot4.attach(mot4_pin, 1000, 2000);
+
+  mot1.writeMicroseconds(1000); mot2.writeMicroseconds(1000);
+  mot3.writeMicroseconds(1000); mot4.writeMicroseconds(1000);
+  delay(1000);
+
+  // Calibration Offsets (Tune these via serial output while stationary)
+  RateCalibrationRoll  = 0.04; RateCalibrationPitch = -0.20; RateCalibrationYaw   = -0.04;
+  AccXCalibration = 0.01; AccYCalibration = 0.01; AccZCalibration = 0.98;
+
+  LoopTimer = micros();
+}
+
+// ============================================================================
+// MAIN FLIGHT LOOP
+// ============================================================================
+void loop() {
+  uint32_t currentMicros = micros();
+
+  // Run at strictly 250Hz (4000 microseconds)
+  if (currentMicros - LoopTimer >= 4000) {
+    LoopTimer = currentMicros;
+
+    // 1. Read IMU
+    Wire.beginTransmission(0x68); Wire.write(0x3B); Wire.endTransmission(); 
+    Wire.requestFrom(0x68, 6);
+    int16_t AccXLSB = Wire.read() << 8 | Wire.read();
+    int16_t AccYLSB = Wire.read() << 8 | Wire.read();
+    int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+    
+    Wire.beginTransmission(0x68); Wire.write(0x43); Wire.endTransmission();
+    Wire.requestFrom(0x68, 6);
+    int16_t GyroX = Wire.read() << 8 | Wire.read();
+    int16_t GyroY = Wire.read() << 8 | Wire.read();
+    int16_t GyroZ = Wire.read() << 8 | Wire.read();
+
+    // 2. Scale & Calibrate
+    RateRoll  = ((float)GyroX / 65.5f) - RateCalibrationRoll;
+    RatePitch = ((float)GyroY / 65.5f) - RateCalibrationPitch;
+    RateYaw   = ((float)GyroZ / 65.5f) - RateCalibrationYaw;
+
+    AccX = ((float)AccXLSB / 4096.0f) - AccXCalibration;
+    AccY = ((float)AccYLSB / 4096.0f) - AccYCalibration;
+    AccZ = ((float)AccZLSB / 4096.0f) - AccZCalibration;
+
+    AngleRoll  = atan(AccY / sqrt(AccX * AccX + AccZ * AccZ)) * 57.29f;
+    AnglePitch = -atan(AccX / sqrt(AccY * AccY + AccZ * AccZ)) * 57.29f;
+
+    // 3. Complementary Filter
+    complementaryAngleRoll  = 0.991f * (complementaryAngleRoll + RateRoll * t) + 0.009f * AngleRoll;
+    complementaryAnglePitch = 0.991f * (complementaryAnglePitch + RatePitch * t) + 0.009f * AnglePitch;
+    complementaryAngleRoll  = constrain(complementaryAngleRoll, -20.0f, 20.0f);
+    complementaryAnglePitch = constrain(complementaryAnglePitch, -20.0f, 20.0f);
+
+    // 4. Read RC Inputs
+    float DesiredAngleRoll  = 0.1f * (ReceiverValue[0] - 1500);
+    float DesiredAnglePitch = 0.1f * (ReceiverValue[1] - 1500);
+    float InputThrottle     = ReceiverValue[2];
+    float DesiredRateYaw    = 0.15f * (ReceiverValue[3] - 1500);
+
+    // 5. PID Calculations (Cascade Structure)
+    // Angle Loop (Outer)
+    float DesiredRateRoll = computePID(DesiredAngleRoll - complementaryAngleRoll, PAngleRoll, IAngleRoll, DAngleRoll, PrevErrorAngleRoll, PrevItermAngleRoll, PrevDtermAngleRoll, t);
+    float DesiredRatePitch = computePID(DesiredAnglePitch - complementaryAnglePitch, PAnglePitch, IAnglePitch, DAnglePitch, PrevErrorAnglePitch, PrevItermAnglePitch, PrevDtermAnglePitch, t);
+
+    // Rate Loop (Inner)
+    float InputRoll  = computePID(DesiredRateRoll - RateRoll, PRateRoll, IRateRoll, DRateRoll, PrevErrorRateRoll, PrevItermRateRoll, PrevDtermRateRoll, t);
+    float InputPitch = computePID(DesiredRatePitch - RatePitch, PRatePitch, IRatePitch, DRatePitch, PrevErrorRatePitch, PrevItermRatePitch, PrevDtermRatePitch, t);
+    float InputYaw   = computePID(DesiredRateYaw - RateYaw, PRateYaw, IRateYaw, DRateYaw, PrevErrorRateYaw, PrevItermRateYaw, PrevDtermRateYaw, t);
+
+    // 6. Motor Mixing (Quad X)
+    InputThrottle = constrain(InputThrottle, ThrottleCutOff, 1800);
+    
+    int MotorInput1 = (int)(InputThrottle - InputRoll - InputPitch - InputYaw); // FR
+    int MotorInput2 = (int)(InputThrottle - InputRoll + InputPitch + InputYaw); // RR
+    int MotorInput3 = (int)(InputThrottle + InputRoll + InputPitch - InputYaw); // RL
+    int MotorInput4 = (int)(InputThrottle + InputRoll - InputPitch + InputYaw); // FL
+
+    // 7. Safety, Constraints, and Failsafe
+    bool isFailsafe = (micros() - last_rx_time) > 500000; // 500ms without RC signal = Failsafe
+
+    if (ReceiverValue[2] < 1030 || isFailsafe) { // Throttle cut OR Failsafe
+      MotorInput1 = ThrottleCutOff; MotorInput2 = ThrottleCutOff;
+      MotorInput3 = ThrottleCutOff; MotorInput4 = ThrottleCutOff;
+
+      // Reset I-terms & D-terms to prevent windup spooling when re-arming
+      PrevItermAngleRoll=0; PrevItermAnglePitch=0;
+      PrevItermRateRoll=0; PrevItermRatePitch=0; PrevItermRateYaw=0;
+      PrevDtermRateRoll=0; PrevDtermRatePitch=0; PrevDtermRateYaw=0;
+    } else {
+      // Normal Flight Constraints
+      MotorInput1 = constrain(MotorInput1, ThrottleIdle, 2000);
+      MotorInput2 = constrain(MotorInput2, ThrottleIdle, 2000);
+      MotorInput3 = constrain(MotorInput3, ThrottleIdle, 2000);
+      MotorInput4 = constrain(MotorInput4, ThrottleIdle, 2000);
+    }
+
+    // 8. Write to Motors
+    mot1.writeMicroseconds(MotorInput1);
+    mot2.writeMicroseconds(MotorInput2);
+    mot3.writeMicroseconds(MotorInput3);
+    mot4.writeMicroseconds(MotorInput4);
+
+    // 9. Telemetry / Debugging (Uncomment as needed, but keep brief so loop stays <4ms)
+    // Serial.printf("Roll: %.2f | Pitch: %.2f | M1: %d | M2: %d \n", complementaryAngleRoll, complementaryAnglePitch, MotorInput1, MotorInput2);
+  }
+}
